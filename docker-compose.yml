@@ -1,0 +1,159 @@
+version: "3.9"
+
+services:
+
+  # ── Application ──────────────────────────────────────────────
+
+  secureops-api:
+    build:
+      context:
+      dockerfile: docker/Dockerfile.api
+    ports:
+      - "8000:8000"
+
+    env_file: config/ .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy    
+      kafka:
+        condition: service_started
+      weaviate:
+        condition: service_started
+      volumes:
+        - ./:/app
+      restart: unless-stopped
+      healthcheck:
+        test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+        interval: 30s
+        timeout : 10s
+        retries : 3
+
+  # ── PostgreSQL + TimescaleDB ──────────────────────────────────
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    ports: 
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: secureops
+      POSTGRES_USER: secureops
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes: 
+    - postgres_data:/var/lib/postgresql/data
+    - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secureops"]
+      interval: 10s
+      timeout: 5s
+      retries: 5  
+
+
+  # ── Redis ────────────────────────────────────────────────────      
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Kafka + Zookeeper ────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  # ── Weaviate (vector store) ──────────────────────────────────
+  weaviate:
+    image: semitechnologies/weaviate:1.24.0
+    ports:
+      - "8080:8080"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 100
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: /var/lib/weaviate
+      DEFAULT_VECTORIZER_MODULE: none
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+
+  # ── OPA (policy engine) ──────────────────────────────────────
+  opa:
+    image: openpolicyagent/opa:latest
+    ports:
+      - "8181:8181"
+    command:
+      - "run"
+      - "--server"
+      - "--addr=0.0.0.0:8181"
+      - "/policies"
+    volumes:
+      - ./policies/opa:/policies
+
+  # ── Grafana ──────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/secureops.json
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/dashboards:/etc/grafana/dashboards
+    depends_on:
+      - prometheus
+
+  # ── Prometheus ───────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/metrics/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+
+  # ── Loki (log aggregation) ───────────────────────────────────
+  loki:
+    image: grafana/loki:2.9.0
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  zookeeper_data:
+  weaviate_data:
+  grafana_data:
+  prometheus_data:
+  loki_data:
+
+networks:
+  default:
+    name: secureops-network
+  
